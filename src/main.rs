@@ -1,5 +1,6 @@
 pub mod terminal;
 
+use chrono::Local;
 use nix::sys::termios::Termios;
 
 use crate::terminal::enable_raw_mode;
@@ -9,7 +10,8 @@ use std::{
     io::{self, BufRead, Read, Write},
 };
 
-const KILO_TAB: usize = 8;
+const KILO_TAB: usize = 4;
+const KILO_QUIT_TIMES: usize = 3;
 
 // Util functions
 fn ctrl_key(k: char) -> char {
@@ -24,6 +26,8 @@ fn write_stdout(buf: &[u8]) {
 }
 
 enum EditorKey {
+    Backspace,
+    Enter,
     ArrowLeft,
     ArrowRight,
     ArrowUp,
@@ -49,7 +53,10 @@ struct Editor {
     num_rows: usize,
     row: Vec<String>,
     render: Vec<String>,
+    dirty: bool,
+    quit_times: usize,
     filename: String,
+    status_message: String,
     _orig_termios: Termios,
 }
 
@@ -67,7 +74,10 @@ impl Editor {
             num_rows: 0,
             row: Vec::new(),
             render: Vec::new(),
+            dirty: false,
+            quit_times: KILO_QUIT_TIMES,
             filename: String::new(),
+            status_message: String::new(),
             _orig_termios: enable_raw_mode(),
         }
     }
@@ -98,7 +108,7 @@ impl Editor {
 
         self.screen_rows = parts.next().unwrap().parse::<usize>().unwrap();
         self.screen_cols = parts.next().unwrap().parse::<usize>().unwrap();
-        self.screen_rows -= 1; // Status bar
+        self.screen_rows -= 2; // Status bar
     }
 
     fn read_key() -> EditorKey {
@@ -149,7 +159,11 @@ impl Editor {
                 _ => return EditorKey::Char('\x1b'),
             }
         } else {
-            return EditorKey::Char(buffer[0] as char);
+            match buffer[0] {
+                b'\r' => return EditorKey::Enter,
+                8 | 127 => return EditorKey::Backspace,
+                _ => return EditorKey::Char(buffer[0] as char),
+            }
         }
     }
 
@@ -219,7 +233,7 @@ impl Editor {
                 }
                 return;
             }
-            EditorKey::Char(_) | EditorKey::DelKey => {
+            _ => {
                 return;
             }
         }
@@ -247,18 +261,49 @@ impl Editor {
             | EditorKey::PageUp
             | EditorKey::PageDown
             | EditorKey::HomeKey
-            | EditorKey::EndKey
-            | EditorKey::DelKey => {
+            | EditorKey::EndKey => {
                 self.move_cursor(c);
+            }
+            EditorKey::Enter => return,
+            EditorKey::Backspace | EditorKey::DelKey => {
+                // self.move_cursor(EditorKey::ArrowRight);
+                self.del_char();
+                return;
             }
             EditorKey::Char(c) => {
                 if c == ctrl_key('q') {
+                    if self.dirty && self.quit_times > 0 {
+                        self.status_message = format!(
+                            "WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.",
+                            self.quit_times
+                        );
+                        self.quit_times -= 1;
+                        return;
+                    }
                     write_stdout(b"\x1b[2J");
                     write_stdout(b"\x1b[H");
                     std::process::exit(0);
                 }
+
+                if c == ctrl_key('r') {
+                    self.get_window_size();
+                    return;
+                }
+
+                if c == ctrl_key('l') {
+                    return;
+                }
+
+                if c == ctrl_key('s') {
+                    self.save();
+                    return;
+                }
+
+                self.insert_char(c);
             }
         }
+
+        self.quit_times = KILO_QUIT_TIMES;
     }
 
     fn row_cx_to_rx(&self, row: &String) -> usize {
@@ -272,6 +317,46 @@ impl Editor {
             }
         }
         rx
+    }
+
+    fn row_insert_char(row: &mut String, at: usize, c: char) {
+        if at > row.len() {
+            row.push(c);
+        } else {
+            row.insert(at, c);
+        }
+    }
+
+    fn row_del_char(row: &mut String, at: usize) {
+        if at > row.len() {
+            return;
+        }
+        let _ = row.remove(at);
+    }
+
+    /*** Editor Operations ***/
+    fn insert_char(&mut self, c: char) {
+        // If we are at the last line create a new line
+        if self.cy == self.num_rows {
+            self.row.push(String::new());
+            self.num_rows += 1;
+        }
+        Self::row_insert_char(&mut self.row[self.cy], self.cx, c);
+        self.cx += 1;
+        self.dirty = true;
+        self.update_render();
+    }
+
+    fn del_char(&mut self) {
+        if self.cy == self.num_rows {
+            return;
+        }
+
+        if self.cx > 0 {
+            Self::row_del_char(&mut self.row[self.cy], self.cx - 1);
+            self.cx -= 1;
+            self.update_render();
+        }
     }
 
     fn scroll(&mut self) {
@@ -342,14 +427,18 @@ impl Editor {
 
     fn draw_status_bar(&mut self) {
         self.buffer.push_str("\x1b[7m"); // Inverted colors
-        let mut filename = String::new();
-        if self.filename.is_empty() {
-            filename.push_str("[No Name]");
+        let filename = if self.filename.is_empty() {
+            "[No Name]".to_string()
         } else {
-            filename.push_str(self.filename.as_str());
-        }
+            self.filename.clone()
+        };
+        let dirty = if self.dirty {
+            "(modified)".to_string()
+        } else {
+            "".to_string()
+        };
 
-        let status = format!("{:.20} - {}", filename, self.num_rows);
+        let status = format!("{:.20} - {} lines {}", filename, self.num_rows, dirty);
         let rstatus = format!("{}/{}", self.cy + 1, self.num_rows);
         let mut len = status.len();
         if len > self.screen_cols {
@@ -367,6 +456,27 @@ impl Editor {
             }
         }
         self.buffer.push_str("\x1b[m"); // Switches back to normal colors
+        self.buffer.push_str("\r\n");
+    }
+
+    fn draw_message_bar(&mut self) {
+        self.buffer.push_str("\x1b[K");
+        let mut len = self.status_message.len();
+        if len > self.screen_cols {
+            len = self.screen_cols;
+        }
+        let time = Local::now().format("%H:%M:%S").to_string();
+        self.buffer.push_str(&self.status_message[..len]);
+
+        while len < self.screen_cols {
+            if self.screen_cols - len == time.len() {
+                self.buffer.push_str(time.as_str());
+                break;
+            } else {
+                self.buffer.push(' ');
+                len += 1;
+            }
+        }
     }
 
     fn refresh_screen(&mut self) {
@@ -378,6 +488,7 @@ impl Editor {
 
         self.editor_draw_rows();
         self.draw_status_bar();
+        self.draw_message_bar();
 
         let cursor_position = format!(
             "\x1b[{};{}H",
@@ -388,6 +499,23 @@ impl Editor {
 
         self.buffer.push_str("\x1b[?25h");
         write_stdout(self.buffer.as_bytes());
+    }
+
+    fn update_render(&mut self) {
+        self.render.clear();
+
+        for (i, line) in self.row.iter().enumerate() {
+            self.render.push(String::new());
+            for char in line.chars() {
+                if char == '\t' {
+                    for _ in 0..KILO_TAB {
+                        self.render[i].push(' ');
+                    }
+                } else {
+                    self.render[i].push(char);
+                }
+            }
+        }
     }
 
     pub fn open(&mut self, filename: &str) {
@@ -409,18 +537,30 @@ impl Editor {
         } else {
             eprintln!("Couldn't open file: {}", filename);
         }
+        self.update_render();
+    }
 
-        for (i, line) in self.row.iter().enumerate() {
-            self.render.push(String::new());
-            for char in line.chars() {
-                if char == '\t' {
-                    for _ in 0..KILO_TAB {
-                        self.render[i].push(' ');
-                    }
-                } else {
-                    self.render[i].push(char);
-                }
+    fn save(&mut self) {
+        if self.filename.is_empty() {
+            return;
+        }
+
+        let mut text_to_save = String::new();
+
+        for line in self.row.iter() {
+            text_to_save.push_str(line.as_str());
+            text_to_save.push('\n');
+        }
+
+        if let Ok(mut file) = File::create(&self.filename) {
+            if let Ok(bytes) = file.write(text_to_save.as_bytes()) {
+                self.status_message = format!("{} bytes written to disk", bytes);
+                self.dirty = false;
+            } else {
+                self.status_message = "Can't save!".to_string();
             }
+        } else {
+            eprintln!("Couldn't open file: {}", self.filename);
         }
     }
 
@@ -440,6 +580,7 @@ fn main() {
     if args.len() >= 2 {
         editor.open(&args[1]);
     }
+    editor.status_message = "HELP: Ctrl-S = save | Ctrl-Q = quit".to_string();
 
     editor.run();
 }
